@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
 
@@ -21,6 +22,16 @@ from utils.downloading import (
     resolve_storage_path,
     save_dataset_profile,
 )
+
+if TYPE_CHECKING:  # annotation only; provider is imported lazily inside main()
+    from ml4t.data.providers.fred import FREDProvider
+
+# FRED /series/observations knobs for first-release (point-in-time) retrieval.
+# output_type=4 = "initial release only"; it requires a real-time RANGE spanning
+# all history (the default today..today returns HTTP 400 "No vintage dates exist").
+FRED_OUTPUT_TYPE_INITIAL_RELEASE = 4
+FRED_REALTIME_START = "1776-07-04"
+FRED_REALTIME_END = "9999-12-31"
 
 
 def collect_series(config: dict[str, object]) -> dict[str, dict[str, str]]:
@@ -108,6 +119,78 @@ def compute_derived(df: pl.DataFrame, derived_defs: list[dict[str, str]]) -> pl.
     return result
 
 
+def build_aligned_panel(
+    daily_frames: list[pl.DataFrame], request_start: str, end_date: str,
+    derived_defs: list[dict[str, str]],
+) -> pl.DataFrame:
+    """Left-join per-series [date, <series>] frames onto a daily calendar and
+    forward-fill, then add derived columns. Shared by the revised and
+    first-release passes so both panels have identical schema."""
+    dates = pl.date_range(
+        datetime.strptime(request_start, "%Y-%m-%d"),
+        datetime.strptime(end_date, "%Y-%m-%d"),
+        eager=True,
+    )
+    aligned = pl.DataFrame({"date": dates})
+    for series_frame in daily_frames:
+        series_name = next(col for col in series_frame.columns if col != "date")
+        aligned = aligned.join(series_frame, on="date", how="left")
+        aligned = aligned.with_columns(pl.col(series_name).forward_fill())
+    return compute_derived(aligned, derived_defs)
+
+
+def fetch_first_release(
+    provider: FREDProvider, series_id: str, frequency: str, start: str, end: str
+) -> pl.DataFrame:
+    """Return the FIRST-RELEASE (initially published) observations for a series,
+    in the provider's canonical OHLCV schema.
+
+    Non-daily series use FRED ``output_type=4`` ("initial release only") in a
+    single call, reusing the provider's session + ``_transform_data`` so missing
+    values and schema match the revised path. ``output_type=4`` requires a
+    real-time RANGE (the default today..today errors with "No vintage dates"),
+    and FRED caps it at 2000 vintage dates.
+
+    Daily rate/market series (DGS*, VIXCLS, DFF, T10Y2Y) have >2000 vintage dates
+    (so output_type=4 is rejected) and are never revised — their first release IS
+    their final value — so the standard fetch is returned for them.
+    """
+    if frequency == "daily":
+        return provider.fetch_ohlcv(series_id, start=start, end=end, frequency=frequency)
+
+    freq_code = provider.FREQUENCY_MAP.get(frequency.lower())
+    if not freq_code:
+        raise ValueError(f"Unsupported frequency '{frequency}' for {series_id}")
+    endpoint = f"{provider.BASE_URL}/series/observations"
+    params = {
+        "series_id": series_id.upper(),
+        "api_key": provider.api_key,
+        "file_type": "json",
+        "observation_start": start,
+        "observation_end": end,
+        "frequency": freq_code,
+        "output_type": FRED_OUTPUT_TYPE_INITIAL_RELEASE,
+        "realtime_start": FRED_REALTIME_START,
+        "realtime_end": FRED_REALTIME_END,
+    }
+    provider._acquire_rate_limit()
+    response = provider.session.get(endpoint, params=params)
+    if response.status_code != 200:
+        # Surface FRED's own error_message (e.g. rate-limit 429, or the
+        # output_type=4 "> 2000 vintage dates" 400) so failures are diagnosable
+        # rather than an opaque HTTPError.
+        try:
+            detail = response.json().get("error_message", response.text[:200])
+        except Exception:
+            detail = response.text[:200]
+        raise RuntimeError(
+            f"FRED first-release request for {series_id} failed "
+            f"(HTTP {response.status_code}): {detail}"
+        )
+    observations = response.json().get("observations", [])
+    return provider._transform_data(observations, series_id)
+
+
 def main() -> None:
     parser = create_base_parser("Download macro data from FRED")
     parser.add_argument(
@@ -151,6 +234,9 @@ def main() -> None:
     aligned_path = storage_path / str(outputs.get("aligned_file", "fred_macro.parquet"))
     raw_path = storage_path / str(outputs.get("raw_file", "fred_macro_raw.parquet"))
     metadata_path = storage_path / str(outputs.get("metadata_file", "fred_macro_metadata.parquet"))
+    firstrelease_path = storage_path / str(
+        outputs.get("firstrelease_file", "fred_macro_firstrelease.parquet")
+    )
     start_date = str(config.get("start", "2000-01-01"))
     end_date = date.today().isoformat() if args.update else str(config.get("end", "2025-12-31"))
 
@@ -178,6 +264,7 @@ def main() -> None:
                 "output_file": str(aligned_path),
                 "raw_file": str(raw_path),
                 "metadata_file": str(metadata_path),
+                "firstrelease_file": str(firstrelease_path),
             },
             dry_run=True,
         )
@@ -185,96 +272,164 @@ def main() -> None:
 
     storage_path.mkdir(parents=True, exist_ok=True)
     provider = FREDProvider(api_key=api_key)
-    request_start = start_date
-    if args.update and aligned_path.exists():
-        last_date = pl.read_parquet(aligned_path).select(pl.col("date").max()).item()
-        if last_date is not None:
-            request_start = (last_date + timedelta(days=1)).isoformat()
+    try:
+        request_start = start_date
+        if args.update and aligned_path.exists():
+            last_date = pl.read_parquet(aligned_path).select(pl.col("date").max()).item()
+            if last_date is not None:
+                request_start = (last_date + timedelta(days=1)).isoformat()
 
-    daily_frames: list[pl.DataFrame] = []
-    raw_frames: list[pl.DataFrame] = []
-    failed: list[str] = []
+        daily_frames: list[pl.DataFrame] = []
+        raw_frames: list[pl.DataFrame] = []
+        failed: list[str] = []
+        # Daily (frequency == "daily") series are never revised, so their revised
+        # values ARE their first release. On a full (non-update) run we reuse these
+        # frames in the first-release pass instead of re-fetching them.
+        revised_daily_frames: dict[str, pl.DataFrame] = {}
 
-    print("\nDownloading configured series...\n")
-    for series_id, meta in requested.items():
-        frequency = meta["frequency"]
-        description = meta["description"]
-        print(f"  {series_id} ({frequency})...", end=" ", flush=True)
-        try:
-            frame = provider.fetch_ohlcv(
-                series_id,
-                start=request_start,
-                end=end_date,
-                frequency=frequency,
-            )
-            if frame.is_empty():
-                print("EMPTY")
-                failed.append(series_id)
-                continue
-
-            series_col = series_id.lower()
-            series_frame = frame.select(
-                [
-                    pl.col("timestamp").cast(pl.Date).alias("date"),
-                    pl.col("close").alias(series_col),
-                ]
-            )
-            daily_frames.append(series_frame)
-            raw_frames.append(
-                series_frame.rename({series_col: "value"}).with_columns(
-                    pl.lit(series_col).alias("series")
+        print("\nDownloading configured series...\n")
+        for series_id, meta in requested.items():
+            frequency = meta["frequency"]
+            description = meta["description"]
+            print(f"  {series_id} ({frequency})...", end=" ", flush=True)
+            try:
+                frame = provider.fetch_ohlcv(
+                    series_id,
+                    start=request_start,
+                    end=end_date,
+                    frequency=frequency,
                 )
+                if frame.is_empty():
+                    print("EMPTY")
+                    failed.append(series_id)
+                    continue
+
+                series_col = series_id.lower()
+                series_frame = frame.select(
+                    [
+                        pl.col("timestamp").cast(pl.Date).alias("date"),
+                        pl.col("close").alias(series_col),
+                    ]
+                )
+                daily_frames.append(series_frame)
+                if frequency == "daily":
+                    revised_daily_frames[series_col] = series_frame
+                raw_frames.append(
+                    series_frame.rename({series_col: "value"}).with_columns(
+                        pl.lit(series_col).alias("series")
+                    )
+                )
+                print(f"OK ({len(frame):,} rows) [{description}]")
+            except Exception as exc:
+                print(f"ERROR ({exc})")
+                failed.append(series_id)
+
+        if not daily_frames:
+            print("ERROR: no macro series downloaded")
+            sys.exit(1)
+
+        aligned = build_aligned_panel(
+            daily_frames, request_start, end_date, list(config.get("derived", []))
+        )
+        raw_df = pl.concat(raw_frames, how="vertical_relaxed").sort(["series", "date"])
+
+        aligned = (
+            combine_aligned(aligned_path, aligned)
+            if args.update and aligned_path.exists()
+            else aligned
+        )
+        raw_df = combine_raw(raw_path, raw_df) if args.update and raw_path.exists() else raw_df
+        metadata_df = build_metadata(config, series_map)
+
+        atomic_write_parquet(aligned, aligned_path)
+        atomic_write_parquet(raw_df, raw_path)
+        atomic_write_parquet(metadata_df, metadata_path)
+        profile_path = save_dataset_profile(
+            aligned,
+            aligned_path,
+            source="BookMacroDownloader",
+            timestamp_col="date",
+            symbol_col=None,
+        )
+
+        # First-release (point-in-time) pass: each observation's INITIALLY published
+        # value, so downstream regime models see only what was knowable at the time.
+        # First-release values are immutable, and output_type=4 returns the whole
+        # history in one call, so we ALWAYS rebuild over the full [start_date, end_date]
+        # range — including under --update. Incrementing observation_start would
+        # silently drop lagged monthly/quarterly releases whose period date predates
+        # the new start, so the panel is fully re-fetched (and atomically replaced).
+        print_section("FIRST-RELEASE (POINT-IN-TIME) PASS")
+        # Revised daily frames are reusable only when the revised pass fetched full
+        # history (a non-update run); on --update it fetched incrementally.
+        reuse_daily = not args.update
+
+        fr_frames: list[pl.DataFrame] = []
+        fr_failed: list[str] = []
+        for series_id, meta in requested.items():
+            frequency = meta["frequency"]
+            series_col = series_id.lower()
+            print(f"  {series_id} ({frequency})...", end=" ", flush=True)
+            try:
+                if frequency == "daily" and reuse_daily and series_col in revised_daily_frames:
+                    fr_frames.append(revised_daily_frames[series_col])
+                    print("OK [reused revised (daily)]")
+                    continue
+
+                frame = fetch_first_release(
+                    provider, series_id, frequency, start_date, end_date
+                )
+                if frame.is_empty():
+                    print("EMPTY")
+                    fr_failed.append(series_id)
+                    continue
+                fr_frames.append(
+                    frame.select(
+                        [
+                            pl.col("timestamp").cast(pl.Date).alias("date"),
+                            pl.col("close").alias(series_col),
+                        ]
+                    )
+                )
+                note = "first==revised (daily)" if frequency == "daily" else "initial release"
+                print(f"OK ({len(frame):,} rows) [{note}]")
+            except Exception as exc:
+                print(f"ERROR ({exc})")
+                fr_failed.append(series_id)
+
+        firstrelease_rows = 0
+        if fr_frames:
+            # Full rebuild over [start_date, end_date]; first-release values are
+            # immutable so this is idempotent and atomically replaces the file.
+            firstrelease = build_aligned_panel(
+                fr_frames, start_date, end_date, list(config.get("derived", []))
             )
-            print(f"OK ({len(frame):,} rows) [{description}]")
-        except Exception as exc:
-            print(f"ERROR ({exc})")
-            failed.append(series_id)
+            atomic_write_parquet(firstrelease, firstrelease_path)
+            save_dataset_profile(
+                firstrelease, firstrelease_path, source="BookMacroDownloader",
+                timestamp_col="date", symbol_col=None,
+            )
+            firstrelease_rows = len(firstrelease)
+        else:
+            print("WARNING: no first-release series fetched; skipping first-release panel")
 
-    provider.close()
-
-    if not daily_frames:
-        print("ERROR: no macro series downloaded")
-        sys.exit(1)
-
-    dates = pl.date_range(
-        datetime.strptime(request_start, "%Y-%m-%d"),
-        datetime.strptime(end_date, "%Y-%m-%d"),
-        eager=True,
-    )
-    aligned = pl.DataFrame({"date": dates})
-    for series_frame in daily_frames:
-        series_name = next(col for col in series_frame.columns if col != "date")
-        aligned = aligned.join(series_frame, on="date", how="left")
-        aligned = aligned.with_columns(pl.col(series_name).forward_fill())
-
-    aligned = compute_derived(aligned, list(config.get("derived", [])))
-    raw_df = pl.concat(raw_frames, how="vertical_relaxed").sort(["series", "date"])
-
-    aligned = (
-        combine_aligned(aligned_path, aligned) if args.update and aligned_path.exists() else aligned
-    )
-    raw_df = combine_raw(raw_path, raw_df) if args.update and raw_path.exists() else raw_df
-    metadata_df = build_metadata(config, series_map)
-
-    atomic_write_parquet(aligned, aligned_path)
-    atomic_write_parquet(raw_df, raw_path)
-    atomic_write_parquet(metadata_df, metadata_path)
-    profile_path = save_dataset_profile(
-        aligned, aligned_path, source="BookMacroDownloader", timestamp_col="date", symbol_col=None
-    )
-
-    print_download_summary(
-        {
-            "rows": len(aligned),
-            "columns": len(aligned.columns),
-            "failed_series": len(failed),
-            "date_range": f"{aligned['date'].min()} to {aligned['date'].max()}",
-            "output_file": str(aligned_path),
-            "raw_file": str(raw_path),
-            "metadata_file": str(metadata_path),
-            "profile_file": str(profile_path),
-        }
-    )
+        print_download_summary(
+            {
+                "rows": len(aligned),
+                "columns": len(aligned.columns),
+                "failed_series": len(failed),
+                "date_range": f"{aligned['date'].min()} to {aligned['date'].max()}",
+                "output_file": str(aligned_path),
+                "raw_file": str(raw_path),
+                "metadata_file": str(metadata_path),
+                "profile_file": str(profile_path),
+                "firstrelease_file": str(firstrelease_path),
+                "firstrelease_rows": firstrelease_rows,
+                "firstrelease_failed": len(fr_failed),
+            }
+        )
+    finally:
+        provider.close()
 
 
 if __name__ == "__main__":

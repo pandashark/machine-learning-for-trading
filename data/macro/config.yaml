@@ -29,6 +29,7 @@ macro:
     aligned_file: fred_macro.parquet
     raw_file: fred_macro_raw.parquet
     metadata_file: fred_macro_metadata.parquet
+    firstrelease_file: fred_macro_firstrelease.parquet
 
   series:
     daily:
