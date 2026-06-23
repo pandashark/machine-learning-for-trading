@@ -198,3 +198,5 @@ case_studies/*/catalog/*.json
 
 # Review tooling config (dev-only)
 .roborev.toml
+# roborev snapshots
+/.roborev/
